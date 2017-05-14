@@ -78,9 +78,8 @@ class Game:
         orders = self.__post_treat_orders(orders_per_factory)
         return orders
 
-    # ==============================================
-    @staticmethod
-    def __post_treat_orders(orders_per_factory):
+    # ================================================
+    def __post_treat_orders(self, orders_per_factory):
         """Post treat orders, remove opposite moves between factories."""
         final_move_orders = {} # source, destination, nb
         final_bomb_order = [] # [source, destination]
@@ -98,7 +97,7 @@ class Game:
                         final_move_orders[destination][fi] -= nb
                     else:
                         if nb > final_move_orders[destination][fi]:
-                            if fi not in final_orders.keys():
+                            if fi not in final_move_orders.keys():
                                 final_move_orders[fi] = {}
                             final_move_orders[fi][destination] = nb - final_move_orders[destination][fi]
                         del final_move_orders[destination][fi]
@@ -119,10 +118,14 @@ class Game:
                 else:
                     orders = "MOVE " + str(src) + " " + str(destination) + " " + str(nb)
         for src, destination in final_bomb_order:
-            if orders != "":
-                orders += ";BOMB " + str(src) + " " + str(destination)
-            else: # TODO : pas envoyer une bombe deux fois au même endroit (avant 5 tours)
-                orders = "BOMB " + str(src) + " " + str(destination)
+            if self.__all_factory[destination].get_future_state(src, final_move_orders) == "e" and \
+               (destination not in self.__sent_bombs.keys() or
+               self.__sent_bombs[destination] + 4 < self.__current_turn):
+                if orders != "":
+                    orders += ";BOMB " + str(src) + " " + str(destination)
+                else:
+                    orders = "BOMB " + str(src) + " " + str(destination)
+                self.__sent_bombs[destination] = self.__current_turn
         for fi in final_increase_order:
             if orders != "":
                 orders += ";INC " + str(fi)
@@ -205,11 +208,14 @@ class Factory:
                     a = 100 / (MIN_DIST - MAX_DIST)
                     b = -a * MAX_DIST
                     percent = min(100, a * nb_turn + b)
-                check_available = available_cyborg + available_cyborg * percent / 100
+                #check_available = available_cyborg + available_cyborg * percent / 100
+                # TODO : ICI !!!
+                check_available = available_cyborg * percent / 100
                 # print_err("check_available =", check_available, percent)
                 nb_sent_cyborg = 0
                 for nb_cyborg in nb_cyborg_per_turn.values():
                     # print_err(nb_cyborg)
+                    print_err(self.__id, target[0], nb_cyborg, check_available)
                     if target[0] is not None and 0 < nb_cyborg < check_available:
                         percent_cyborg = int(nb_cyborg * percent / 100)
                         new_nb_sent_cyborg = max(min(available_cyborg, percent_cyborg), 1)
@@ -343,6 +349,64 @@ class Factory:
         if target[0] is not None:
             order = [target[0], 10]
         return order
+
+    # ====================================================
+    def get_future_state(self, factory_id, current_moves):
+        """
+        Get the state of the factory (enemy/mine/neutral) according to
+        the distance from the factory_id.
+
+        :param factory_id: the id of the factory to consider the distance from
+        :type factory_id: int
+        :param current_moves: the current decided moves {src:{destination:nb_cy}}
+        :type current_moves: dict{int:{int:int}}
+        :return: The state
+        :rtype: "e"|"m"|"n"
+        """
+        # coming_cyborg = {"m":{time:nb}, "e":{time:nb}}
+        coming_cyborg = {"m": {}, "e": {}}
+        for owner in ["e", "m"]:
+            for nb, t in self.__coming_cyborgs[owner]:
+                if t not in coming_cyborg[owner].keys():
+                    coming_cyborg[owner][t] = 0
+                coming_cyborg[owner][t] += nb
+
+        for src, dict_src in current_moves.items():
+            if self.__id in dict_src.keys():
+                nb = dict_src[self.__id]
+                _, d = self.__connections[src]
+                if d not in coming_cyborg["m"].keys():
+                    coming_cyborg["m"][d] = 0
+                coming_cyborg["m"][d] += nb
+
+        current_owner = self.__owner
+        nb_cyborg_in_factory = self.__nb_cyborg
+
+        _, d = self.__connections[factory_id]
+        for t in range(d + 1):
+            if current_owner != "n":
+                if self.__turn_until_product_back == 0:
+                    nb_cyborg_in_factory += self.__production
+            if t not in coming_cyborg["m"].keys():
+                coming_cyborg["m"][t] = 0
+            if t not in coming_cyborg["e"].keys():
+                coming_cyborg["e"][t] = 0
+            nb_cyborg_left = coming_cyborg["m"][t] - coming_cyborg["e"][t]
+            winner = "m"
+            if nb_cyborg_left < 0:
+                winner = "e"
+            elif nb_cyborg_left == 0:
+                winner = "n"
+            nb_cyborg_left = abs(nb_cyborg_left)
+            if winner != "n":
+                if winner != current_owner:
+                    nb_cyborg_in_factory -= nb_cyborg_left
+                    if nb_cyborg_in_factory < 0:
+                        current_owner = winner
+                        nb_cyborg_in_factory = abs(nb_cyborg_in_factory)
+                else:
+                    nb_cyborg_in_factory += nb_cyborg_left
+        return current_owner
 
     # ======================
     def get_nb_cyborg(self):
