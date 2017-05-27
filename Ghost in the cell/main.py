@@ -11,6 +11,12 @@ def print_err(*args):
     stderr.flush()
 
 
+INCREASE_CONDITION = 0
+ATTACK_DIST = 500
+DEF_DIST = 500
+BOMB_DIST = [4, 6, 8, 10]
+
+
 # =========
 class Game:
     """
@@ -37,14 +43,16 @@ class Game:
 
     # ======================================
     def __set_closest_enemy_factories(self):
+        """..."""
         # Get the list of enemy factory from which "self" is the closest
         closest_dict = {}  # {enemy_id:[mine_id, dist]}
         for fi, f in enumerate(self.__all_factory):
             f.reset_closest_enemies()
-            cur_closest_dict = f.get_enemies_dist()
-            for fi_enemy, d in cur_closest_dict.items():
-                if fi_enemy not in closest_dict.keys() or d < closest_dict[fi_enemy][1]:
-                    closest_dict[fi_enemy] = [fi, d]
+            if f.is_mine():
+                cur_closest_dict = f.get_enemies_dist()
+                for fi_enemy, d in cur_closest_dict.items():
+                    if fi_enemy not in closest_dict.keys() or d < closest_dict[fi_enemy][1]:
+                        closest_dict[fi_enemy] = [fi, d]
 
         for fi_enemy, [fi, _] in closest_dict.items():
             self.__all_factory[fi].add_closest_enemy(fi_enemy)
@@ -71,18 +79,53 @@ class Game:
     def get_orders(self):
         """Compute best order to give to all factories."""
         orders_per_factory = {}
+        enemy_estimated_orders = self.__get_enemy_impacting_moves()
+        my_moves = [{}]
         for fi, f in enumerate(self.__all_factory):
             if f.is_mine():
                 orders_per_factory[fi] = f.get_orders(self.__nb_enemy_cyborg,
-                                                      self.__nb_mine_cyborg)
+                                                      self.__nb_mine_cyborg,
+                                                      enemy_estimated_orders,
+                                                      my_moves)
+                self.__update_my_moves(my_moves, orders_per_factory[fi], fi)
         orders = self.__post_treat_orders(orders_per_factory)
         return orders
+
+    def __update_my_moves(self, my_moves, factory_orders, fi):
+        move_orders = factory_orders[0]
+        for destination, nb in move_orders:
+            if destination not in my_moves[-1].keys():
+                my_moves[-1][destination] = {}
+            d = self.__all_factory[fi].get_distance(destination)
+            if d not in my_moves[-1][destination].keys():
+                my_moves[-1][destination][d] = 0
+            my_moves[-1][destination][d] += nb
+
+    def __get_enemy_impacting_moves(self):
+        """You don't get it?"""
+        orders_per_factory = {}
+        for fi, f in enumerate(self.__all_factory):
+            if f.is_enemy():
+                orders_per_factory[fi] = f.get_orders(self.__nb_enemy_cyborg,
+                                                      self.__nb_mine_cyborg)
+        estimated_orders = [{}]
+        for fi, orders in orders_per_factory.items():
+            move_orders = orders[0]
+            for destination, nb in move_orders:
+                if destination not in estimated_orders[-1].keys():
+                    estimated_orders[-1][destination] = {}
+                d = self.__all_factory[fi].get_distance(destination)
+                if d not in estimated_orders[-1][destination].keys():
+                    estimated_orders[-1][destination][d] = 0
+                estimated_orders[-1][destination][d] += nb
+        # print_err("estimated_orders", estimated_orders)
+        return estimated_orders
 
     # ================================================
     def __post_treat_orders(self, orders_per_factory):
         """Post treat orders, remove opposite moves between factories."""
-        final_move_orders = {} # source, destination, nb
-        final_bomb_order = [] # [source, destination]
+        final_move_orders = {}  # source, destination, nb
+        final_bomb_order = []  # [source, destination]
         final_increase_order = []
         for fi, [move_order, bomb_order, increase_order] in orders_per_factory.items():
             for [destination, nb] in move_order:
@@ -120,7 +163,7 @@ class Game:
         for src, destination in final_bomb_order:
             if self.__all_factory[destination].get_future_state(src, final_move_orders) == "e" and \
                (destination not in self.__sent_bombs.keys() or
-               self.__sent_bombs[destination] + 4 < self.__current_turn):
+               self.__sent_bombs[destination] + 9 < self.__current_turn):
                 if orders != "":
                     orders += ";BOMB " + str(src) + " " + str(destination)
                 else:
@@ -159,100 +202,142 @@ class Factory:
         self.__closest_enemies = []
 
     # ====================================================
-    def get_orders(self, nb_enemy_cyborg, nb_mine_cyborg):
+    def get_orders(self, nb_enemy_cyborg, nb_mine_cyborg, estimated_enemy_moves=None, my_moves=None):
         """Get the orders for one given factory."""
+        considered_owner = "m"
+        if estimated_enemy_moves is None:
+            considered_owner = "e"
         increase_order = False
+        move_orders = []
         available_cyborg = self.__nb_cyborg
-        if self.__increase_production_order(nb_enemy_cyborg, nb_mine_cyborg):
+        pre_move_orders = self.__get_moves_orders(nb_enemy_cyborg, nb_mine_cyborg,
+                                                  available_cyborg, estimated_enemy_moves, my_moves,
+                                                  forced_mode="attack")
+        # print_err("get_orders, pre_move_orders=", self.__id, pre_move_orders)
+        for [destination, nb] in pre_move_orders:
+            if self.__connections[destination][0].get_production() > 1:
+                available_cyborg -= nb
+                move_orders.append([destination, nb])
+        if self.__increase_production_order(nb_enemy_cyborg, nb_mine_cyborg, estimated_enemy_moves, available_cyborg):
             increase_order = True
             available_cyborg -= 10
 
-        move_orders = self.__get_moves_orders(nb_enemy_cyborg, nb_mine_cyborg, available_cyborg)
-
-        bomb_orders = self.__get_bomb_orders()
+        # print_err("get_orders", self.__id, available_cyborg, increase_order)
+        post_move_orders = []
+        if len(self.__coming_cyborgs[considered_owner]) == 0 or self.__production == 3:
+            post_move_orders = self.__get_moves_orders(nb_enemy_cyborg, nb_mine_cyborg,
+                                                       available_cyborg, estimated_enemy_moves, my_moves)
+        for order in post_move_orders:
+            move_orders.append(order)
+        # print_err("moves_order =", move_orders)
+        bomb_orders = self.__get_bomb_orders(estimated_enemy_moves, my_moves)
 
         return move_orders, bomb_orders, increase_order
 
     # ==============================================================================
-    def __get_moves_orders(self, nb_enemy_cyborg, nb_mine_cyborg, available_cyborg):
+    def __get_moves_orders(self, nb_enemy_cyborg, nb_mine_cyborg, available_cyborg, estimated_enemy_moves, my_moves,
+                           forced_mode="defense"):
         """Compute best moves for the factory to first defend, then attack."""
         move_orders = []
         no_more_order = False
         treated_destinations = []
         # Look for all possible orders (while the factory can take control or help another)
-        target_type = "defense"
-        while not no_more_order or target_type == "defense":
+        target_type = forced_mode
+        while not no_more_order or target_type != "attack":
             # print_err("-----------------", self.__id)
             if no_more_order:
-                if available_cyborg > 10:
-                    order = self.__look_for_factory_to_increase(nb_enemy_cyborg, nb_mine_cyborg)
-                    if order is not None:
+                if target_type == "defense":
+                    orders = self.__look_for_factory_to_increase(nb_enemy_cyborg, nb_mine_cyborg, estimated_enemy_moves,
+                                                                 my_moves, available_cyborg)
+                    for order in orders:
                         move_orders.append(order)
                         available_cyborg -= order[1]
-                target_type = "attack"
+                    target_type = "attack"
+                elif target_type == "wall":
+                    target_type = "attack"
             # no_more_target_factory = stop criteria -> while we have a move, we look for another
-            target, no_more_target_factory = self.__get_target(target_type, treated_destinations)
+            target, no_more_target_factory = self.__get_target(target_type, treated_destinations, estimated_enemy_moves)
             # print_err(target)
             # Target found, factory can attack or help
             if target[0] is not None:
                 # Compute the number of cyborg necessary to take control or save
                 f, nb_turn = self.__connections[target[0]]
-                nb_cyborg_per_turn = f.get_needed_cyborg(nb_turn + 1)
-                # print_err(target[0], nb_cyborg_per_turn, available_cyborg)
+                if target_type != "wall":
+                    nb_cyborg_per_turn = f.get_needed_cyborg(nb_turn + 1, estimated_enemy_moves, my_moves)
+                else:
+                    nb_cyborg_per_turn = {nb_turn: self.__nb_cyborg-1}
+                # if estimated_enemy_moves is not None:
+                #     print_err("Target found:", self.__id, target[0], nb_cyborg_per_turn, available_cyborg, nb_turn)
                 # If not enough, we just give up for now (should be changed for defense...)
                 # compute linear percent
                 percent = 100
-                if target_type == "attack":
-                    MAX_DIST = 19
-                    MIN_DIST = 4
-                    a = 100 / (MIN_DIST - MAX_DIST)
-                    b = -a * MAX_DIST
-                    percent = min(100, a * nb_turn + b)
-                #check_available = available_cyborg + available_cyborg * percent / 100
-                # TODO : ICI !!!
+                # if target_type == "attack":
+                #     MAX_DIST = 19
+                #     MIN_DIST = 4
+                #     a = 100 / (MIN_DIST - MAX_DIST)
+                #     b = -a * MAX_DIST
+                #     percent = min(100, a * nb_turn + b)
+                # check_available = available_cyborg + available_cyborg * percent / 100
                 check_available = available_cyborg * percent / 100
                 # print_err("check_available =", check_available, percent)
                 nb_sent_cyborg = 0
-                for nb_cyborg in nb_cyborg_per_turn.values():
+                nb_cyborg = nb_cyborg_per_turn[nb_turn]
+                if True:
+                    # for nb_cyborg in nb_cyborg_per_turn.values():
                     # print_err(nb_cyborg)
-                    print_err(self.__id, target[0], nb_cyborg, check_available)
-                    if target[0] is not None and 0 < nb_cyborg < check_available:
+                    # print_err(self.__id, target[0], nb_cyborg, check_available)
+                    if target[0] is not None and 0 < nb_cyborg <= check_available:
+                        # print_err("Et si on entre", self.__id, target[0], nb_cyborg)
                         percent_cyborg = int(nb_cyborg * percent / 100)
                         new_nb_sent_cyborg = max(min(available_cyborg, percent_cyborg), 1)
-                        # print_err(percent_cyborg, new_nb_sent_cyborg)
+                        # print_err("Try attack!", percent_cyborg, new_nb_sent_cyborg)
                         # print_err("check danger ----", self.__id, nb_sent_cyborg)
-                        if not self.is_in_danger(new_nb_sent_cyborg):
+                        if not self.is_in_danger(estimated_enemy_moves, new_nb_sent_cyborg):
                             nb_sent_cyborg = new_nb_sent_cyborg
                 # print_err(nb_sent_cyborg)
                 if nb_sent_cyborg > 0:
                     # print_err(percent, nb_turn, available_cyborg, nb_cyborg,
-                    # nb_sent_cyborg, check_available, percent_cyborg)
+                    #           nb_sent_cyborg, check_available, percent_cyborg)
                     move_orders.append([target[0], nb_sent_cyborg])
                     available_cyborg -= nb_sent_cyborg
+
                 # Factory treated! Don't forget that or infinite loop! ^.^
                 treated_destinations.append(target[0])
                 # print_err(available_cyborg, len(treated_destinations), move_orders)
             # Keep at least one cyborg just in case...
-            no_more_order = available_cyborg < 2 or no_more_target_factory
+            no_more_order = no_more_target_factory  # available_cyborg < 2 or no_more_target_factory
+
+        # check if cyborg available to send to increase directly
+        for i, [fi, nb] in enumerate(move_orders):
+            if available_cyborg >= 10 and \
+                            self.__connections[fi][0].get_production() < 3 and \
+                    not self.is_in_danger(estimated_enemy_moves, nb + 10):
+                move_orders[i][1] += 10
 
         return move_orders
 
     # =====================================================================
-    def __increase_production_order(self, nb_enemy_cyborg, nb_mine_cyborg):
+    def __increase_production_order(self, nb_enemy_cyborg, nb_mine_cyborg, estimated_enemy_moves, available_cyborg):
         """Check if increase production is worth it."""
+        # print_err("increase self?", self.__id, self.is_in_danger(estimated_enemy_moves, 10))
         order = False
-        nb_cyborg_more = 10 * nb_mine_cyborg / 100
-        if nb_enemy_cyborg <= (nb_mine_cyborg - nb_cyborg_more):
-            if (self.__production == 0 and self.__nb_cyborg >= 20 or
-                self.__production == 1 and self.__nb_cyborg >= 15 or
-                self.__production == 2 and self.__nb_cyborg >= 10) and \
-               not self.is_in_danger(10):
+        nb_cyborg_more = INCREASE_CONDITION * nb_mine_cyborg / 100
+        already_sent = self.__nb_cyborg - available_cyborg
+        # print_err("increase cond", self.__id, INCREASE_CONDITION, nb_enemy_cyborg, nb_mine_cyborg, nb_cyborg_more)
+        # print_err(already_sent, self.is_in_danger(estimated_enemy_moves, already_sent+10))
+        if INCREASE_CONDITION == 0 or nb_enemy_cyborg <= (nb_mine_cyborg - nb_cyborg_more):
+            if (self.__production == 0 and available_cyborg >= 10 or
+                self.__production == 1 and available_cyborg >= 10 or
+                self.__production == 2 and available_cyborg >= 10) and \
+               not self.is_in_danger(estimated_enemy_moves, already_sent + 10):
                 order = True
         return order
 
     # ==========================
-    def __get_bomb_orders(self):
+    def __get_bomb_orders(self, estimated_enemy_moves, my_moves):
         """Bomb order..."""
+        # print_err("Bomb order...", self.__id, estimated_enemy_moves)
+        # print_err("Bomb order...", self.__closest_enemies)
         orders = []
         best_factory_enemy = [None, None]
         for fi in self.__closest_enemies:
@@ -265,54 +350,92 @@ class Factory:
                 best_factory_enemy = [f, fi]
         if best_factory_enemy[0] is not None:
             f, dist = self.__connections[best_factory_enemy[1]]
-            if dist < 7:
-                production = f.get_production()
-                cyborg = f.get_nb_cyborg()
-                if production == 0 and cyborg > 20 or \
-                   production == 1 and cyborg > 15 or \
-                   production == 2 and cyborg > 10 or \
-                   production == 3:
-                    nb_cyborg_per_turn = f.get_needed_cyborg(dist + 1)
-                    if nb_cyborg_per_turn[dist + 1] > 0:
-                        # print_err("BOMB", best_factory_enemy[1], nb_cyborg_per_turn)
-                        orders.append(best_factory_enemy[1])
+            production = f.get_effective_production()
+            cyborg = f.get_nb_cyborg()
+            if production == 0 and cyborg > 20 and dist < BOMB_DIST[0] or \
+               production == 1 and cyborg > 10 and dist < BOMB_DIST[1] or \
+               production == 2 and cyborg > 5 and dist < BOMB_DIST[2] or \
+               production == 3 and dist < BOMB_DIST[3]:
+                nb_cyborg_per_turn = f.get_needed_cyborg(dist + 1, estimated_enemy_moves, my_moves)
+                if nb_cyborg_per_turn[dist + 1] > 0:
+                    # print_err("BOMB", best_factory_enemy[1], nb_cyborg_per_turn)
+                    orders.append(best_factory_enemy[1])
         return orders
 
+    def get_effective_production(self):
+        """..."""
+        if self.__turn_until_product_back > 0:
+            return 0
+        return self.__production
+
     # ==============================================================
-    def __get_target(self, target_type, treated_destinations):
+    def __get_target(self, target_type, treated_destinations, estimated_enemy_moves):
         """Get the best target for the given factory"""
-        # print_err("get_target", target_type, self.__id, treated_destinations)
-        target = [None, -1, None]  # if of factory, production of factory, number of cyborg in it
+        # print_err("get_target", target_type, self.__id, treated_destinations, estimated_enemy_moves)
+        target = [None, -1]  # if of factory, production of factory, number of cyborg in it
         no_more_target_factory = True
         cur_dist = float("inf")
-
+        if target_type == "wall":
+            cur_dist = self.__check_enemy_dist(estimated_enemy_moves is not None)
         for fi, [f, d] in self.__connections.items():
+            check_owner = f.is_mine
+            if estimated_enemy_moves is None:
+                check_owner = f.is_enemy
             # If factory already treated we don't test it (allows to find same type of factory but more far)
-            if fi not in treated_destinations and \
-               (target_type == "attack" and not f.is_mine() or target_type == "defense" and f.is_mine()):
-                # Take the closest with better production
-                if d <= cur_dist and f.get_production() >= target[1] and \
-                   f.get_production() >= 0 and self.__id != fi:
-                    cur_dist = d
-                    target = [fi, f.get_production(), f.get_nb_cyborg()]
-                    # print_err(target, d)
-                    no_more_target_factory = False
+            if fi not in treated_destinations:
+                if (target_type == "attack" and not check_owner() or
+                   target_type == "defense" and check_owner()):
+                    # Take the closest with better production
+                    if target_type == "attack" and d < ATTACK_DIST or \
+                       target_type == "defense" and d < DEF_DIST:
+                        if f.get_production() >= target[1] and \
+                           f.get_production() >= 0 and \
+                           self.__id != fi and \
+                           d <= cur_dist:
+                            cur_dist = d
+                            target = [fi, f.get_production()]
+                            # print_err(target, d)
+                            no_more_target_factory = False
+                elif target_type == "wall":
+                    # if self.__id == 5:
+                    #     print_err("__get_target - wall", fi, f.__check_enemy_dist(estimated_enemy_moves is not None), cur_dist)
+                    if check_owner and f.__check_enemy_dist() < cur_dist:
+                        cur_dist = f.__check_enemy_dist(estimated_enemy_moves is not None)
+                        target = [fi, f.get_production()]
+                        no_more_target_factory = False
+
         return target, no_more_target_factory
 
+    def __check_enemy_dist(self, check_mine=True):
+        """..."""
+        dist = float("inf")
+        for fi, [f, d] in self.__connections.items():
+            check_owner = f.is_mine
+            if not check_mine:
+                check_owner = f.is_enemy
+            if not check_owner() and d < dist:
+                dist = d
+        return dist
+
     # ==================================================================
-    def is_in_danger(self, nb_less_cyborg=0):
+    def is_in_danger(self, estimated_enemy_moves, nb_less_cyborg=0):
         """Check if the factory is going to be taken."""
+        considered_owner = "m"
+        considered_enemy = "e"
+        if estimated_enemy_moves is None:
+            considered_owner = "e"
+            considered_enemy = "m"
         enemy_factory_dist_cyborg = []
         for fi, [factory, dist] in self.__connections.items():
-            if factory.is_enemy():
+            if estimated_enemy_moves is not None and factory.is_enemy() or factory.is_mine():
                 enemy_factory_dist_cyborg.append([dist, factory.get_nb_cyborg()])
         # Check each time
-        # print_err("in danger", self.__nb_cyborg, nb_less_cyborg)
+        # print_err("in danger", self.__id, self.__nb_cyborg, nb_less_cyborg)
         diff = {0: self.__nb_cyborg - nb_less_cyborg}  # per time
         for d, nb_cyborg in enemy_factory_dist_cyborg:
             if d in [1] and False:
-                diff[d] = -nb_cyborg # - self.__production
-        for n, t in self.__coming_cyborgs['m']:
+                diff[d] = -nb_cyborg  # - self.__production
+        for n, t in self.__coming_cyborgs[considered_owner]:
             if t not in diff.keys():
                 for i in range(t + 1):
                     if i not in diff.keys():
@@ -320,7 +443,7 @@ class Factory:
                         if i >= self.__turn_until_product_back:
                             diff[i] += self.__production
             diff[t] += n
-        for n, t in self.__coming_cyborgs['e']:
+        for n, t in self.__coming_cyborgs[considered_enemy]:
             if t not in diff.keys():
                 for i in range(t + 1):
                     if i not in diff.keys():
@@ -328,34 +451,60 @@ class Factory:
                         if i >= self.__turn_until_product_back:
                             diff[i] += self.__production
             diff[t] -= n
+
+        if estimated_enemy_moves is not None and self.__id in estimated_enemy_moves[0].keys():
+            for t, n in estimated_enemy_moves[0][self.__id].items():
+                if t not in diff.keys():
+                    for i in range(t + 1):
+                        if i not in diff.keys():
+                            diff[i] = diff[i - 1]
+                            if i >= self.__turn_until_product_back:
+                                diff[i] += self.__production
+                diff[t] -= estimated_enemy_moves[0][self.__id][t]
+
         # print_err(diff)
         for t, n in diff.items():
-            if n <= 0:
+            if n < 0:
                 return True
         return False
 
     # ===================================================
-    def __look_for_factory_to_increase(self, nb_enemy_cyborg, nb_mine_cyborg):
-        # TODO : multiple increase?
-        # TODO : envoyer que le nécessaire, pas "10" (vérifier si in_danger)
-        target = [None, float("inf")]
-        if nb_enemy_cyborg < (nb_mine_cyborg - 5) and not self.is_in_danger(10):
-            for fi, [f, d] in self.__connections.items():
-                if f.is_mine():
-                    if 0 <= f.get_production() < 3:
-                        if d < target[1]:
-                            target = [fi, d]
-        order = None
-        if target[0] is not None:
-            order = [target[0], 10]
-        return order
+    def __look_for_factory_to_increase(self, nb_enemy_cyborg, nb_mine_cyborg, estimated_enemy_moves, my_moves,
+                                       available_cyborg):
+        # print_err("look_to_increase", self.__id, nb_enemy_cyborg, nb_mine_cyborg, estimated_enemy_moves)
+        targets = []
+        cur_send_cyborg = 0
+        nb_cyborg_more = INCREASE_CONDITION * nb_mine_cyborg / 100
+        if INCREASE_CONDITION == 0 or nb_enemy_cyborg <= (nb_mine_cyborg - nb_cyborg_more):
+            no_more_fact = False
+            already_treated = []
+            while not no_more_fact:
+                no_more_fact = True
+                closest_target = [None, 7, 0]
+                for fi, [f, d] in self.__connections.items():
+                    if fi not in already_treated:
+                        check_owner = f.is_mine
+                        if estimated_enemy_moves is None:
+                            check_owner = f.is_enemy
+                        if check_owner() and 0 <= f.get_production() < 3 and d < closest_target[1]:
+                            nb_cyborg_to_send = 10 + f.get_needed_cyborg(d, estimated_enemy_moves, my_moves)[d]
+                            if nb_cyborg_to_send > 0 and not self.is_in_danger(estimated_enemy_moves,
+                                                                               cur_send_cyborg + nb_cyborg_to_send):
+                                if available_cyborg >= nb_cyborg_to_send:
+                                    no_more_fact = False
+                                    closest_target = [fi, d, nb_cyborg_to_send]
+                if closest_target[0] is not None:
+                    targets.append([closest_target[0], closest_target[2]])
+                    already_treated.append(closest_target[0])
+                    cur_send_cyborg += closest_target[2]
+        # print_err("look_to_increase", self.__id, targets)
+        return targets
 
     # ====================================================
     def get_future_state(self, factory_id, current_moves):
         """
         Get the state of the factory (enemy/mine/neutral) according to
         the distance from the factory_id.
-
         :param factory_id: the id of the factory to consider the distance from
         :type factory_id: int
         :param current_moves: the current decided moves {src:{destination:nb_cy}}
@@ -429,32 +578,60 @@ class Factory:
         return self.__owner == "e"
 
     # ==========================
-    def get_needed_cyborg(self, nb_turn):
+    def get_needed_cyborg(self, nb_turn, estimated_enemy_moves, my_moves):
         """Get number of cyborg to take control or save the factory."""
-        # print_err(self.__coming_cyborgs, nb_turn)
+        # if estimated_enemy_moves is not None:
+        #     print_err("get_needed_cy", self.__id, self.__coming_cyborgs, nb_turn, estimated_enemy_moves)
+        considered_owner = "m"
+        considered_enemy = "e"
+        if estimated_enemy_moves is None:
+            considered_owner = "e"
+            considered_enemy = "m"
         needed_cyborg = {}
-        if self.__owner == "m":
+        if self.__owner == considered_owner:
             needed_cyborg[0] = -self.__nb_cyborg
         else:
             needed_cyborg[0] = self.__nb_cyborg + 1
         current_owner = self.__owner
-        for i in range(nb_turn+1):
+        for i in range(1, nb_turn + 1):
             if i not in needed_cyborg.keys():
-                needed_cyborg[i] = needed_cyborg[i-1]
-            if current_owner == "m" and i >= self.__turn_until_product_back:
-                needed_cyborg[i] -= self.__production
-            elif current_owner == "e" and i >= self.__turn_until_product_back:
-                needed_cyborg[i] += self.__production
-            for n, t in self.__coming_cyborgs['m']:
+                needed_cyborg[i] = needed_cyborg[i - 1]
+            if i >= self.__turn_until_product_back:
+                if current_owner == considered_owner:
+                    needed_cyborg[i] -= self.__production
+                elif current_owner == considered_enemy:
+                    needed_cyborg[i] += self.__production
+            for n, t in self.__coming_cyborgs[considered_owner]:
                 if t == i:
                     needed_cyborg[i] -= n
                     if needed_cyborg[i] < 0:
-                        current_owner = "m"
-            for n, t in self.__coming_cyborgs['e']:
+                        current_owner = considered_owner
+            for n, t in self.__coming_cyborgs[considered_enemy]:
                 if t == i:
-                    needed_cyborg[i] += n
+                    if current_owner == "n":
+                        needed_cyborg[i] = abs((needed_cyborg[i] - 1) - n)
+                    else:
+                        needed_cyborg[i] += n
                     if needed_cyborg[i] > 0:
-                        current_owner = "e"
+                        current_owner = considered_enemy
+                        needed_cyborg[i] += 1
+            if estimated_enemy_moves is not None and \
+               self.__id in estimated_enemy_moves[0].keys() and \
+               i in estimated_enemy_moves[0][self.__id].keys():
+                if current_owner == "n":
+                    needed_cyborg[i] = abs((needed_cyborg[i] - 1) - estimated_enemy_moves[0][self.__id][i]) + 1
+                else:
+                    needed_cyborg[i] += estimated_enemy_moves[0][self.__id][i] + 1
+                if needed_cyborg[i] > 0:
+                    current_owner = considered_enemy
+            if my_moves is not None and \
+               self.__id in my_moves[0].keys() and \
+               i in my_moves[0][self.__id].keys():
+                needed_cyborg[i] -= my_moves[0][self.__id][i]
+                if needed_cyborg[i] < 0:
+                    current_owner = considered_owner
+        # if estimated_enemy_moves is not None:
+        #     print_err("needed_cy = ", needed_cyborg)
         return needed_cyborg
 
     # =========================
@@ -465,6 +642,10 @@ class Factory:
             if f.is_enemy():
                 dists[fi] = d
         return dists
+
+    def get_distance(self, fi):
+        """..."""
+        return self.__connections[fi][1]
 
     # ================================================
     def set_info(self, owner, nb_cyborg, prod, disabled_turn, coming_cyborg):
